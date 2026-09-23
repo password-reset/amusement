@@ -1,0 +1,10 @@
+{
+    "domain":        "",
+    "teams_token":   "",
+    "refresh_token": "",
+    "client_id":     "",
+    "region":        "amer",
+    "threads":       5,
+    "ports":         "25,465,587",
+    "teams_output":  "teams_valid.txt"
+}
