@@ -3,7 +3,7 @@
 amusement.py - M365 Teams external-chat user enumeration + SMTP audit.
 
 EXTRACTING BEARER + REFRESH TOKENS (Teams PWA)
-  1. Open Teams (PWA or https://teams.microsoft.com) in Brave/Chrome/Edge
+  1. Open Teams (PWA or https://teams.cloud.microsoft) in Brave/Chrome/Edge
   2. Press F12 > Console
   3. Paste this one-liner:
 
@@ -115,17 +115,23 @@ def _jwt_exp(token):
     except Exception:
         return -1
 
+TEAMS_ORIGINS = ['https://teams.cloud.microsoft', 'https://teams.microsoft.com']
+
+
 def _do_refresh(refresh_token, client_id=None):
-    r = requests.post(TOKEN_URL, data={
-        'grant_type':    'refresh_token',
-        'client_id':     client_id or TEAMS_CLIENT_ID,
-        'refresh_token': refresh_token,
-        'scope':         'https://api.spaces.skype.com/.default offline_access',
-    }, headers={'Origin': 'https://teams.microsoft.com'}, timeout=30)
-    if r.status_code != 200:
-        return None, None, r.text[:200]
-    d = r.json()
-    return d.get('access_token'), d.get('refresh_token'), None
+    for origin in TEAMS_ORIGINS:
+        r = requests.post(TOKEN_URL, data={
+            'grant_type':    'refresh_token',
+            'client_id':     client_id or TEAMS_CLIENT_ID,
+            'refresh_token': refresh_token,
+            'scope':         'https://api.spaces.skype.com/.default offline_access',
+        }, headers={'Origin': origin}, timeout=30)
+        if r.status_code == 200:
+            d = r.json()
+            return d.get('access_token'), d.get('refresh_token'), None
+        if 'AADSTS9002327' not in r.text:
+            break
+    return None, None, r.text[:200]
 
 
 class TokenHolder:
@@ -156,7 +162,9 @@ class TokenHolder:
 
     def _loop(self):
         if self._stop.is_set(): return
-        self.refresh_now()
+        if not self.refresh_now():
+            fail('TOKEN', '', '', 'refresh token is likely burned - auto-refresh stopped')
+            return
         if not self._stop.is_set():
             self._timer = threading.Timer(REFRESH_INTERVAL, self._loop)
             self._timer.daemon = True
@@ -464,10 +472,32 @@ def _resolve_emails(spec, domain=None):
     return out
 
 
+TEAMS_HOSTS = ['teams.cloud.microsoft', 'teams.microsoft.com']
+_teams_host = TEAMS_HOSTS[0]
+
+
+def _pick_teams_host(bearer):
+    """Probe which host returns a useful response. Called once at startup."""
+    global _teams_host
+    auth = bearer if bearer.lower().startswith("bearer") else f"Bearer {bearer}"
+    for host in TEAMS_HOSTS:
+        try:
+            url = f"https://{host}/api/mt/emea/beta/users/probe-nonexistent-99@example.com/externalsearchv3?includeTFLUsers=true"
+            r = requests.get(url, headers={"Authorization": auth, "Accept": "application/json"}, timeout=10)
+            if r.status_code in (200, 403):
+                _teams_host = host
+                info('TEAMS', '', '', f'using API host: {host}')
+                return
+        except Exception:
+            continue
+    _teams_host = TEAMS_HOSTS[0]
+    info('TEAMS', '', '', f'defaulting to API host: {_teams_host}')
+
+
 def teams_external_check(email, bearer=None, region="emea", exists_only=False):
     if not bearer:
         return None
-    url = (f"https://teams.microsoft.com/api/mt/{region}/beta/users/"
+    url = (f"https://{_teams_host}/api/mt/{region}/beta/users/"
            f"{email}/externalsearchv3?includeTFLUsers=true")
     headers = {
         "Authorization": bearer if bearer.lower().startswith("bearer") else f"Bearer {bearer}",
@@ -480,16 +510,23 @@ def teams_external_check(email, bearer=None, region="emea", exists_only=False):
             r = requests.get(url, headers=headers, timeout=15)
             if r.status_code == 200:
                 body = r.json() if r.text.strip() else []
-                if body:
-                    rec = body[0] if isinstance(body, list) else body
-                    tid = rec.get('tenantId', '?')
-                    upn = rec.get('userPrincipalName', '?')
-                    coex = rec.get('featureSettings', {}).get('coExistenceMode', '?')
-                    good('TEAMS', email, '', f'OPEN  tenant={tid}  upn={upn}  coex={coex}')
-                    return email
-                elif not exists_only:
-                    bad('TEAMS', email, '', 'not found or no Teams license')
-                return None
+                if isinstance(body, list) and body:
+                    rec = body[0]
+                elif isinstance(body, dict) and body.get('tenantId'):
+                    rec = body
+                else:
+                    if not exists_only:
+                        bad('TEAMS', email, '', 'not found or no Teams license')
+                    return None
+                tid = rec.get('tenantId', '?')
+                upn = rec.get('userPrincipalName', '?')
+                coex = rec.get('featureSettings', {}).get('coExistenceMode', '?')
+                if tid == '?' and upn == '?':
+                    if not exists_only:
+                        bad('TEAMS', email, '', 'not found or no Teams license')
+                    return None
+                good('TEAMS', email, '', f'OPEN  tenant={tid}  upn={upn}  coex={coex}')
+                return email
             elif r.status_code == 403:
                 warn('TEAMS', email, '', '403 - exists but BLOCKS external chat')
                 return email
@@ -620,6 +657,7 @@ def main():
             return
 
         print()
+        _pick_teams_host(get_bearer())
         info('TEAMS', '', '', f'enumerating {len(emails)} target(s) / {args.threads} threads / region={args.region}')
         valid = []
         with ThreadPoolExecutor(max_workers=args.threads) as pool:
