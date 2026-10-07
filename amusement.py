@@ -494,7 +494,8 @@ def _pick_teams_host(bearer):
     info('TEAMS', '', '', f'defaulting to API host: {_teams_host}')
 
 
-def teams_external_check(email, bearer=None, region="emea", exists_only=False):
+def teams_external_check(email, get_bearer=None, region="emea", exists_only=False):
+    bearer = get_bearer() if callable(get_bearer) else get_bearer
     if not bearer:
         return None
     url = (f"https://{_teams_host}/api/mt/{region}/beta/users/"
@@ -661,7 +662,7 @@ def main():
         info('TEAMS', '', '', f'enumerating {len(emails)} target(s) / {args.threads} threads / region={args.region}')
         valid = []
         with ThreadPoolExecutor(max_workers=args.threads) as pool:
-            futs = {pool.submit(teams_external_check, e, get_bearer(), args.region, args.exists_only): e for e in emails}
+            futs = {pool.submit(teams_external_check, e, get_bearer, args.region, args.exists_only): e for e in emails}
             for fut in as_completed(futs):
                 result = fut.result()
                 if result:
